@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Run a coding agent in a Docker Compose service and relay its herdr state.
+
+usage: herdr-docker-run <kind> [agent args...]
+
+The agent runs fully inside the container. Its herdr integration talks to a
+private relay socket mounted at /run/herdr/herdr.sock. The relay forwards only
+state reports for the launching pane to the real herdr socket:
+
+  * methods: pane.report_agent and pane.release_agent only
+  * pane_id, source and agent are forced to this pane and <kind>
+  * state must be idle | working | blocked; message is capped and cleaned
+  * session references and resume_argv are dropped, because herdr may run a
+    resume command on the host
+
+Everything else (send_keys, read, run, ...) is refused, so the container can
+change the status of its own pane and nothing more.
+
+Configuration (environment, or KEY=VALUE lines in
+$HERDR_PLUGIN_CONFIG_DIR/config.env):
+  HERDR_DOCKER_COMPOSE_FILE   compose file (required)
+  HERDR_DOCKER_SERVICE_<KIND> service for <kind> (default: <kind>)
+  HERDR_DOCKER_WORKSPACE      exported as WORKSPACE for the compose file; "cwd" means
+                              the directory the agent is launched from
+  HERDR_DOCKER_HOME           agent's home inside the container (default /home/agent)
+  HERDR_DOCKER_AGENT_UID      container user's uid (default 1000)
+  HERDR_DOCKER_AGENT_HOST_UID host uid the container user maps to (default:
+                              computed from /etc/subuid under rootless Docker)
+  HERDR_DOCKER_DEBUG          file to log relayed and refused requests to
+"""
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+PLUGIN_ID = "xhluca.docker-agents"
+CONTAINER_SOCKET_DIR = "/run/herdr"
+ALLOWED_STATES = {"idle", "working", "blocked"}
+MAX_LINE = 16 * 1024
+MAX_MESSAGE = 200
+RATE_PER_SEC = 20
+
+# Host-installed herdr integration files (from `herdr integration install <kind>`),
+# mounted read-only at the same place under the container's home.
+INTEGRATIONS = {
+    "pi": [".pi/agent/extensions/herdr-agent-state.ts"],
+    "opencode": [
+        ".config/opencode/plugins/herdr-agent-state.js",  # `opencode run`
+        ".config/opencode/herdr-tui-session.js",          # interactive TUI
+        ".config/opencode/tui.jsonc",                     # loads the TUI plugin
+    ],
+}
+
+
+def debug(*parts):
+    path = os.environ.get("HERDR_DOCKER_DEBUG")
+    if path:
+        with open(path, "a") as f:
+            print(time.strftime("%H:%M:%S"), *parts, file=f)
+
+
+def die(msg):
+    print(f"herdr-docker-run: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def load_config():
+    cfg = {}
+    cfg_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    if not cfg_dir:
+        herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+        if herdr:
+            out = subprocess.run([herdr, "plugin", "config-dir", PLUGIN_ID],
+                                 capture_output=True, text=True)
+            if out.returncode == 0:
+                cfg_dir = out.stdout.strip()
+    if cfg_dir and os.path.isfile(os.path.join(cfg_dir, "config.env")):
+        with open(os.path.join(cfg_dir, "config.env")) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = os.path.expanduser(v.strip().strip("\"'"))
+    cfg.update({k: v for k, v in os.environ.items() if k.startswith("HERDR_DOCKER_")})
+    return cfg
+
+
+def agent_host_uid(cfg):
+    if cfg.get("HERDR_DOCKER_AGENT_HOST_UID"):
+        return int(cfg["HERDR_DOCKER_AGENT_HOST_UID"])
+    container_uid = int(cfg.get("HERDR_DOCKER_AGENT_UID", "1000"))
+    info = subprocess.run(["docker", "info", "--format", "{{.SecurityOptions}}"],
+                          capture_output=True, text=True).stdout
+    if "rootless" not in info:
+        return container_uid
+    user = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+    with open("/etc/subuid") as f:
+        for line in f:
+            name, start, _count = line.strip().split(":")
+            if name in (user, str(os.getuid())):
+                return int(start) + container_uid - 1
+    die(f"no /etc/subuid entry for {user}")
+
+
+def grant(path, uid, perms):
+    """Let the container's mapped uid (and only it, when ACLs are available) use path."""
+    if uid == os.getuid():
+        return
+    if shutil.which("setfacl"):
+        subprocess.run(["setfacl", "-m", f"u:{uid}:{perms}", path], check=True)
+    else:
+        os.chmod(path, 0o711 if os.path.isdir(path) else 0o666)
+
+
+def clean_text(value, limit):
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value)[:limit].strip()
+    return value or None
+
+
+class Relay:
+    def __init__(self, herdr_socket, pane_id, kind):
+        self.herdr_socket = herdr_socket
+        self.pane_id = pane_id
+        self.kind = kind
+        # herdr ignores the official "herdr:<kind>" source unless it also sees the
+        # agent's process in the pane, which it can't for a container. A custom
+        # source holds the pane through reports alone.
+        self.source = f"docker:{kind}"
+        self.tokens = RATE_PER_SEC
+        self.last = time.monotonic()
+        self.held = False
+        self.max_seq = 0
+
+    def allow(self):
+        now = time.monotonic()
+        self.tokens = min(RATE_PER_SEC, self.tokens + (now - self.last) * RATE_PER_SEC)
+        self.last = now
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+
+    def sanitize(self, req):
+        """Rebuild an allowed request from scratch; return None to refuse it."""
+        if not isinstance(req, dict) or not isinstance(req.get("params"), dict):
+            return None
+        method, params = req.get("method"), req["params"]
+        out = {"pane_id": self.pane_id, "source": self.source, "agent": self.kind}
+        seq = params.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and 0 <= seq < 2**63 - 1:
+            out["seq"] = seq
+            self.max_seq = max(self.max_seq, seq)
+        if method == "pane.report_agent":
+            if params.get("state") not in ALLOWED_STATES:
+                return None
+            out["state"] = params["state"]
+            message = clean_text(params.get("message"), MAX_MESSAGE)
+            if message:
+                out["message"] = message
+        elif method != "pane.release_agent":
+            return None
+        return {"id": "relay", "method": method, "params": out}
+
+    def forward(self, req):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(3)
+                s.connect(self.herdr_socket)
+                s.sendall((json.dumps(req) + "\n").encode())
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 65536:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            resp = json.loads(data)
+        except (OSError, ValueError):
+            return False
+        ok = isinstance(resp, dict) and "error" not in resp
+        if ok and req["method"] == "pane.report_agent":
+            self.held = True
+        return ok
+
+    async def handle(self, reader, writer):
+        try:
+            while True:
+                try:
+                    line = await reader.readuntil(b"\n")
+                except (asyncio.LimitOverrunError, asyncio.IncompleteReadError):
+                    break
+                try:
+                    req = json.loads(line)
+                except ValueError:
+                    req = None
+                req_id = req.get("id") if isinstance(req, dict) else None
+                req_id = req_id if isinstance(req_id, str) and len(req_id) <= 200 else None
+                clean = self.sanitize(req) if self.allow() else None
+                debug("in", req if req is not None else line[:200], "->", clean)
+                if clean is None:
+                    resp = {"id": req_id, "error": {"code": "forbidden", "message": "refused by docker relay"}}
+                elif await asyncio.to_thread(self.forward, clean):
+                    resp = {"id": req_id, "result": {"type": "ok"}}
+                else:
+                    resp = {"id": req_id, "error": {"code": "relay_failed", "message": "herdr rejected report"}}
+                writer.write((json.dumps(resp) + "\n").encode())
+                await writer.drain()
+        except OSError:
+            pass
+        finally:
+            writer.close()
+
+    def release(self):
+        """Clear the pane's agent once the container exits (herdr drops stale seqs)."""
+        if self.held:
+            ok = self.forward({"id": "relay:release", "method": "pane.release_agent",
+                               "params": {"pane_id": self.pane_id, "source": self.source,
+                                          "agent": self.kind, "seq": self.max_seq + 1}})
+            debug("release ->", ok)
+
+
+def set_process_name(name):
+    """Keep the pane's foreground process named like the agent.
+
+    `herdr agent start --kind pi` sees the `pi` shim start, then checks that
+    the foreground process is still `pi`; after the shim execs Python it would
+    otherwise be `python3`.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        libc.prctl(15, name.encode()[:15], 0, 0, 0)  # PR_SET_NAME
+    except (OSError, AttributeError):
+        pass
+
+
+def serve(relay, path, uid, ready):
+    async def main():
+        server = await asyncio.start_unix_server(relay.handle, path=path, limit=MAX_LINE)
+        os.chmod(path, 0o600)
+        grant(path, uid, "rw")
+        ready.set()
+        async with server:
+            await server.serve_forever()
+    asyncio.run(main())
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0 if len(sys.argv) > 1 else 2)
+    kind, agent_args = sys.argv[1], sys.argv[2:]
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", kind):
+        die(f"invalid agent kind {kind!r}")
+    set_process_name(kind)
+
+    cfg = load_config()
+    compose = cfg.get("HERDR_DOCKER_COMPOSE_FILE") or die(
+        f"set HERDR_DOCKER_COMPOSE_FILE (env, or config.env in `herdr plugin config-dir {PLUGIN_ID}`)")
+    service = cfg.get(f"HERDR_DOCKER_SERVICE_{kind.upper().replace('-', '_')}", kind)
+    chome = cfg.get("HERDR_DOCKER_HOME", "/home/agent")
+    workspace = cfg.get("HERDR_DOCKER_WORKSPACE")
+    if workspace:
+        os.environ["WORKSPACE"] = os.getcwd() if workspace == "cwd" else workspace
+
+    cmd = ["docker", "compose", "-f", compose, "run", "--rm"]
+    relay = sockdir = None
+    if all(os.environ.get(k) for k in ("HERDR_PANE_ID", "HERDR_SOCKET_PATH")) and os.environ.get("HERDR_ENV") == "1":
+        uid = agent_host_uid(cfg)
+        sockdir = tempfile.mkdtemp(prefix="herdr-docker-", dir=os.environ.get("XDG_RUNTIME_DIR"))
+        grant(sockdir, uid, "x")
+        relay = Relay(os.environ["HERDR_SOCKET_PATH"], os.environ["HERDR_PANE_ID"], kind)
+        ready = threading.Event()
+        threading.Thread(target=serve, args=(relay, os.path.join(sockdir, "herdr.sock"), uid, ready),
+                         daemon=True).start()
+        if not ready.wait(5):
+            die("relay socket did not start")
+        cmd += ["-e", "HERDR_ENV=1", "-e", f"HERDR_PANE_ID={os.environ['HERDR_PANE_ID']}",
+                "-e", f"HERDR_SOCKET_PATH={CONTAINER_SOCKET_DIR}/herdr.sock",
+                "-v", f"{sockdir}:{CONTAINER_SOCKET_DIR}"]
+        files = [f for f in INTEGRATIONS.get(kind, []) if os.path.isfile(os.path.expanduser(f"~/{f}"))]
+        if not files:
+            print(f"herdr-docker-run: no host herdr integration for {kind} "
+                  f"(try `herdr integration install {kind}`); herdr won't see its state", file=sys.stderr)
+        for f in files:
+            cmd += ["-v", f"{os.path.expanduser('~/' + f)}:{chome}/{f}:ro"]
+    cmd += [service] + agent_args
+
+    # Ctrl+C reaches the container through the tty; the launcher only waits.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    child = subprocess.Popen(cmd, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+    code = child.wait()
+    if relay:
+        # Drop the agent's name first: herdr keeps an agent it started while a
+        # foreground process of that name is still alive.
+        set_process_name("herdr-docker")
+        relay.release()
+    if sockdir:
+        shutil.rmtree(sockdir, ignore_errors=True)
+    sys.exit(code if code >= 0 else 128 - code)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Plugin action: open the Docker agent shell as a split pane.
+exec "${HERDR_BIN_PATH:-herdr}" plugin pane open --plugin "${HERDR_PLUGIN_ID:-xhluca.docker-agents}" --entrypoint shell

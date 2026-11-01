@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs pi in Docker via the relay launcher.
+exec "$(dirname "$0")/../bin/herdr-docker-run" pi "$@"

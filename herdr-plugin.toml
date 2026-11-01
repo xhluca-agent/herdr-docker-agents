@@ -1,0 +1,20 @@
+id = "xhluca.docker-agents"
+name = "Docker Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Run coding agents in Docker and still drive them with herdr agent start/prompt/wait, through a filtering state relay"
+platforms = ["linux"]
+
+# A shell whose `pi`, `opencode`, ... run in Docker. Start agents in it with
+#   herdr agent start <name> --kind pi --pane <this pane>
+[[panes]]
+id = "shell"
+title = "Docker agent shell"
+placement = "split"
+command = ["bash", "bin/docker-shell"]
+
+[[actions]]
+id = "open-shell"
+title = "Open Docker agent shell"
+contexts = ["workspace"]
+command = ["bash", "bin/open-shell"]

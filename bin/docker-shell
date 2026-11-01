@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Interactive shell whose PATH starts with the agent shims, so that
+# `herdr agent start <name> --kind pi --pane <this pane>` runs pi in Docker.
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+rc=$(mktemp)
+cat > "$rc" <<EOF
+[ -f ~/.bashrc ] && . ~/.bashrc
+export PATH="$root/shims:\$PATH"
+PS1="[docker] \$PS1"
+rm -f "$rc"
+EOF
+exec bash --rcfile "$rc" -i
