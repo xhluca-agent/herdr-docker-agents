@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs codex in Docker via the relay launcher.
+exec "$(dirname "$0")/../bin/herdr-docker-run" codex "$@"
