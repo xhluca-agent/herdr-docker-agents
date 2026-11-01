@@ -87,7 +87,7 @@ your host the next time *you* use git in that folder.
 ## Install
 
 ```bash
-herdr plugin install xhluca/herdr-docker-agents
+herdr plugin install xhluca-agent/herdr-docker-agents
 cat > "$(herdr plugin config-dir xhluca.docker-agents)/config.env" <<'EOF'
 HERDR_DOCKER_COMPOSE_FILE=~/path/to/compose.yaml
 EOF
